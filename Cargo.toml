@@ -4,6 +4,6 @@ members = [
     "crates/server",
     "crates/cli",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.dependencies]
