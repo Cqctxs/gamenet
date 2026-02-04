@@ -1,29 +1,41 @@
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:7878").await?;
-    
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
+    let public_port = 8080;
+    let target_addr = "127.0.0.1:7878";
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", public_port)).await?;
+    info!("Relay Server: Listening on public port {}", public_port);
+    info!("Relay Server: Forwarding to target {}", target_addr);
+
     loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("New connection from {addr}");
-        
-        // Spawn a task for each connection (like threads, but lighter)
+        let (mut public_stream, addr) = listener.accept().await?;
+        info!("New player connection from {}", addr);
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
-                eprintln!("Error: {e}");
+            match TcpStream::connect(target_addr).await {
+                Ok(mut target_stream) => {
+                    info!("Successfully connected to target agent. Bridging bytes...");
+
+                    // This is the core of Feature B in our architecture.
+                    // It pumps bytes in both directions:
+                    // Player <-> Server <-> Agent
+                    if let Err(e) = copy_bidirectional(&mut public_stream, &mut target_stream).await
+                    {
+                        error!("Bridge error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Could not connect to target agent: {}", e);
+                }
             }
+            info!("Connection from {} closed.", addr);
         });
     }
-}
-
-async fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    
-    let response = b"HTTP/1.1 200 OK\r\n\r\nHello from async!";
-    stream.write_all(response).await?;
-    
-    Ok(())
 }

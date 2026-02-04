@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+gamenet-core = { path = "../core" }
