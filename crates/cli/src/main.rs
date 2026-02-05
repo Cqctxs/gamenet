@@ -6,10 +6,15 @@ use tracing::{info, error};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let agent_port = 7878;
-    let local_game_addr = "127.0.0.1:25565"; // Example: Minecraft
+    let agent_port: u16 = std::env::var("AGENT_PORT")
+        .unwrap_or_else(|_| "7878".to_string())
+        .parse()
+        .expect("AGENT_PORT must be a number");
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", agent_port)).await?;
+    let local_game_addr = std::env::var("GAME_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:25565".to_string());
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", agent_port)).await?;
     info!("CLI Agent: Listening for relay on port {}", agent_port);
 
     loop {
