@@ -18,8 +18,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut reader = BufReader::new(control_stream);
     
-    //  Performance Tip: Creating the buffer outside the loop!
-    // This ensures we reuse the same 1KB of memory for every message we receive.
     let mut buf = [0u8; 1024];
 
     loop {
