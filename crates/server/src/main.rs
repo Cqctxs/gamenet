@@ -7,8 +7,13 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    let public_port = 8080;
-    let target_addr = "127.0.0.1:7878";
+    let public_port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "25565".to_string())
+        .parse()
+        .expect("PORT must be a number");
+
+    let target_addr = std::env::var("TARGET")
+        .unwrap_or_else(|_| "127.0.0.1:7878".to_string());
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", public_port)).await?;
     info!("Relay Server: Listening on public port {}", public_port);
