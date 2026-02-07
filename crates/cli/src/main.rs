@@ -1,38 +1,44 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::copy_bidirectional;
+use gamenet_core::protocol::{ControlMessage, Protocol};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional, BufReader};
 use tracing::{info, error};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let agent_port: u16 = std::env::var("AGENT_PORT")
-        .unwrap_or_else(|_| "7878".to_string())
-        .parse()
-        .expect("AGENT_PORT must be a number");
+    let server_ip = "127.0.0.1";
+    let server_control_addr = format!("{}:5000", server_ip);
+    let mut control_stream = TcpStream::connect(&server_control_addr).await?;
+    info!("Connected to server: {}", server_control_addr);
 
-    let local_game_addr = std::env::var("GAME_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:25565".to_string());
+    // Register
+    let reg = ControlMessage::Register { protocol: Protocol::Tcp, local_port: 25565 };
+    control_stream.write_all(&bincode::serialize(&reg)?).await?;
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", agent_port)).await?;
-    info!("CLI Agent: Listening for relay on port {}", agent_port);
+    let mut reader = BufReader::new(control_stream);
+    
+    //  Performance Tip: Creating the buffer outside the loop!
+    // This ensures we reuse the same 1KB of memory for every message we receive.
+    let mut buf = [0u8; 1024];
 
     loop {
-        let (mut relay_stream, _) = listener.accept().await?;
-        info!("Received connection from relay server.");
+        let n = reader.read(&mut buf).await?;
+        if n == 0 { break; } 
+        
+        let msg: ControlMessage = bincode::deserialize(&buf[..n])?;
+        if let ControlMessage::NewConnection { data_port, .. } = msg {
+            info!("Player joined! Connecting to server data port: {}", data_port);
 
-        tokio::spawn(async move {
-            match TcpStream::connect(local_game_addr).await {
-                Ok(mut game_stream) => {
-                    info!("Connected to local game. Bridging bytes...");
-                    if let Err(e) = copy_bidirectional(&mut relay_stream, &mut game_stream).await {
-                        error!("Bridge error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Could not connect to local game (is it running?): {}", e);
-                }
-            }
-        });
+            let data_addr = format!("{}:{}", server_ip, data_port);
+            let mut server_data_stream = TcpStream::connect(data_addr).await?;
+            let mut local_game_stream = TcpStream::connect("127.0.0.1:25565").await?;
+
+            tokio::spawn(async move {
+                let _ = copy_bidirectional(&mut server_data_stream, &mut local_game_stream).await;
+            });
+        }
     }
+    Ok(())
 }
+

@@ -15,6 +15,7 @@ pub enum ControlMessage {
     /// A new player connection is incoming
     NewConnection {
         stream_id: u64,
+        data_port: u16,
     },
     Error {
         message: String,
