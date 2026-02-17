@@ -9,6 +9,6 @@ use relay::RelayServer;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let server = RelayServer::bind("0.0.0.0:5000").await?;
+    let server = RelayServer::bind("0.0.0.0:5001").await?;
     server.run().await
 }

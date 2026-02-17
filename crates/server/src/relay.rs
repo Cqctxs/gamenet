@@ -15,7 +15,7 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
-    /// Bind the relay server to the given address (e.g. `"0.0.0.0:5000"`).
+    /// Bind the relay server to the given address (e.g. `"0.0.0.0:5001"`).
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
         let control_listener = TcpListener::bind(addr).await?;
         info!("Server: Control port open on {}", addr);

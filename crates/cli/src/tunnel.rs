@@ -14,7 +14,7 @@ pub struct AgentTunnel {
 impl AgentTunnel {
     /// Connect to the relay server and register a tunnel.
     pub async fn connect(server_ip: &str, local_port: u16) -> anyhow::Result<Self> {
-        let control_addr = format!("{}:5000", server_ip);
+        let control_addr = format!("{}:5001", server_ip);
         let mut control_stream = TcpStream::connect(&control_addr).await?;
         info!("Connected to relay server at {}", control_addr);
 
