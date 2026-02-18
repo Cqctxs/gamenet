@@ -10,4 +10,8 @@ serde = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+bytes = { workspace = true }
 gamenet-core = { path = "../core" }

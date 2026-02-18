@@ -1,12 +1,31 @@
-﻿use tokio::io::copy_bidirectional;
+﻿use quinn::{RecvStream, SendStream};
+use tokio::io::copy;
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{error, info};
 
-/// Connect to the server's data port AND the local game, then bridge them.
-pub async fn bridge_player(server_data_addr: &str, local_game_addr: &str) -> anyhow::Result<()> {
-    let mut server_stream = TcpStream::connect(server_data_addr).await?;
-    let mut game_stream = TcpStream::connect(local_game_addr).await?;
-    info!("Bridge established: {} <-> {}", server_data_addr, local_game_addr);
-    copy_bidirectional(&mut server_stream, &mut game_stream).await?;
+/// Bridge a QUIC bi-stream (from the server) to the local game server.
+pub async fn bridge_to_local(
+    mut quic_send: SendStream,
+    mut quic_recv: RecvStream,
+    local_port: u16,
+) -> anyhow::Result<()> {
+    let local_addr = format!("127.0.0.1:{}", local_port);
+    let tcp = TcpStream::connect(&local_addr).await?;
+    info!("Bridge established: QUIC stream <-> {}", local_addr);
+
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    let up = tokio::spawn(async move { copy(&mut quic_recv, &mut tcp_write).await });
+    let down = tokio::spawn(async move { copy(&mut tcp_read, &mut quic_send).await });
+
+    tokio::select! {
+        r = up => {
+            if let Err(e) = r? { error!("Upstream error: {}", e); }
+        }
+        r = down => {
+            if let Err(e) = r? { error!("Downstream error: {}", e); }
+        }
+    }
+    info!("Bridge to {} closed", local_addr);
     Ok(())
 }

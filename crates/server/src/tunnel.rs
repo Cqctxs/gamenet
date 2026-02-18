@@ -2,14 +2,20 @@
 use crate::state::ServerState;
 use gamenet_core::message::{recv_msg, send_msg};
 use gamenet_core::protocol::ControlMessage;
+use quinn::{Connection, SendStream};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// One active tunnel between an agent and its players.
+///
+/// The agent holds a single QUIC connection to the server.
+/// The first bi-stream is the **control channel**.
+/// Each new player gets a fresh QUIC bi-stream (multiplexing).
 pub struct Tunnel {
-    control_stream: TcpStream,
+    quic: Connection,
+    ctrl_send: SendStream,
     state: Arc<Mutex<ServerState>>,
     public_port: u16,
     local_port: u16,
@@ -17,12 +23,15 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Perform the handshake: read Register, assign a port, send TunnelReady.
-    pub async fn from_connection(
-        mut stream: TcpStream,
+    /// Perform the handshake over the first QUIC bi-stream (control channel).
+    pub async fn from_quic(
+        conn: Connection,
         state: Arc<Mutex<ServerState>>,
     ) -> anyhow::Result<Self> {
-        let msg = recv_msg(&mut stream)
+        // The agent opens the first bi-stream as the control channel
+        let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
+
+        let msg = recv_msg(&mut ctrl_recv)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent disconnected before registering"))?;
 
@@ -32,30 +41,63 @@ impl Tunnel {
         };
 
         let public_port = state.lock().await.assign_port(local_port);
-        send_msg(&mut stream, &ControlMessage::TunnelReady { public_port }).await?;
+        send_msg(&mut ctrl_send, &ControlMessage::TunnelReady { public_port }).await?;
 
-        Ok(Self { control_stream: stream, state, public_port, local_port, stream_counter: 0 })
+        info!(
+            "Tunnel registered: public :{} -> agent :{}",
+            public_port, local_port
+        );
+
+        Ok(Self {
+            quic: conn,
+            ctrl_send,
+            state,
+            public_port,
+            local_port,
+            stream_counter: 0,
+        })
     }
 
-    /// Accept players in a loop and bridge each one to the agent.
+    /// Accept TCP players in a loop and bridge each one to the agent via a
+    /// new QUIC bi-stream (multiplexed over the single QUIC connection).
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.public_port)).await?;
-        info!("Tunnel LIVE  :{} -> agent :{}", self.public_port, self.local_port);
+        info!(
+            "Tunnel LIVE  :{} -> agent :{}",
+            self.public_port, self.local_port
+        );
 
         loop {
             let (player, addr) = listener.accept().await?;
-            info!("Player {addr} connected");
+            info!("Player {} connected", addr);
 
-            // Open a one-time data port and tell the agent to connect back
-            let data_listener = TcpListener::bind("0.0.0.0:0").await?;
             self.stream_counter += 1;
-            send_msg(&mut self.control_stream, &ControlMessage::NewConnection {
-                stream_id: self.stream_counter,
-                data_port: data_listener.local_addr()?.port(),
-            }).await?;
+            let stream_id = self.stream_counter;
 
-            let (agent_data, _) = data_listener.accept().await?;
-            bridge::spawn_bridge(player, agent_data, addr);
+            // Notify the agent over the control channel
+            send_msg(
+                &mut self.ctrl_send,
+                &ControlMessage::NewConnection { stream_id },
+            )
+            .await?;
+
+            // Open a new QUIC bi-stream for this player's data
+            let quic = self.quic.clone();
+            tokio::spawn(async move {
+                match quic.open_bi().await {
+                    Ok((quic_send, quic_recv)) => {
+                        if let Err(e) =
+                            bridge::bridge_tcp_to_quic(player, quic_send, quic_recv, addr).await
+                        {
+                            error!("Player {} bridge error: {}", addr, e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to open QUIC stream for player {}: {}", addr, e);
+                    }
+                }
+                info!("Player {} disconnected", addr);
+            });
         }
     }
 

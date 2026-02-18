@@ -1,17 +1,32 @@
-﻿use std::net::SocketAddr;
-use tokio::io::copy_bidirectional;
+﻿use quinn::{RecvStream, SendStream};
+use std::net::SocketAddr;
+use tokio::io::copy;
 use tokio::net::TcpStream;
-use tracing::{error, info};
+use tracing::error;
 
-/// Spawn a background task that bridges two TCP streams.
+/// Bridge a player's TCP connection to a QUIC bi-stream (and vice-versa).
 ///
-/// All data from `player` is forwarded to `agent` and vice versa.
-/// The task runs until either side disconnects.
-pub fn spawn_bridge(mut player: TcpStream, mut agent: TcpStream, player_addr: SocketAddr) {
-    tokio::spawn(async move {
-        if let Err(e) = copy_bidirectional(&mut player, &mut agent).await {
-            error!("Bridge for {} closed: {}", player_addr, e);
+/// Data flows in both directions until either side disconnects.
+pub async fn bridge_tcp_to_quic(
+    tcp: TcpStream,
+    mut quic_send: SendStream,
+    mut quic_recv: RecvStream,
+    player_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    // Two concurrent copy tasks — QUIC send/recv are separate types
+    // so we can't use copy_bidirectional directly.
+    let up = tokio::spawn(async move { copy(&mut tcp_read, &mut quic_send).await });
+    let down = tokio::spawn(async move { copy(&mut quic_recv, &mut tcp_write).await });
+
+    tokio::select! {
+        r = up => {
+            if let Err(e) = r? { error!("Player {} upstream error: {}", player_addr, e); }
         }
-        info!("Player {} disconnected.", player_addr);
-    });
+        r = down => {
+            if let Err(e) = r? { error!("Player {} downstream error: {}", player_addr, e); }
+        }
+    }
+    Ok(())
 }
