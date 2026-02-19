@@ -31,23 +31,45 @@ impl RelayServer {
             let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 let addr = incoming.remote_address();
-                match incoming.await {
-                    Ok(connection) => {
-                        info!("Agent connected from {} (QUIC)", addr);
-                        match Tunnel::from_quic(connection, state).await {
-                            Ok(mut tunnel) => {
-                                if let Err(e) = tunnel.run().await {
-                                    error!("Agent {} tunnel error: {}", addr, e);
-                                }
-                                tunnel.cleanup().await;
+                // Accept the incoming connection and try 0.5-RTT
+                let connecting = match incoming.accept() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to accept incoming from {}: {}", addr, e);
+                        return;
+                    }
+                };
+
+                // Use 0.5-RTT: for incoming connections, into_0rtt() always succeeds
+                let connection = match connecting.into_0rtt() {
+                    Ok((conn, _zero_rtt)) => {
+                        info!("Agent connected from {} (QUIC 0.5-RTT)", addr);
+                        conn
+                    }
+                    Err(connecting) => {
+                        // Fallback: shouldn't happen for incoming, but handle gracefully
+                        match connecting.await {
+                            Ok(conn) => {
+                                info!("Agent connected from {} (QUIC 1-RTT)", addr);
+                                conn
                             }
                             Err(e) => {
-                                error!("Agent {} failed to register: {}", addr, e);
+                                error!("QUIC handshake failed from {}: {}", addr, e);
+                                return;
                             }
                         }
                     }
+                };
+
+                match Tunnel::from_quic(connection, state).await {
+                    Ok(mut tunnel) => {
+                        if let Err(e) = tunnel.run().await {
+                            error!("Agent {} tunnel error: {}", addr, e);
+                        }
+                        tunnel.cleanup().await;
+                    }
                     Err(e) => {
-                        error!("QUIC handshake failed from {}: {}", addr, e);
+                        error!("Agent {} failed to register: {}", addr, e);
                     }
                 }
             });

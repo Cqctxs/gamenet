@@ -38,10 +38,13 @@ pub fn server_config() -> anyhow::Result<(ServerConfig, CertificateDer<'static>)
 /// ⚠️  This is for development only!  In production you should pin or trust
 /// the server certificate.
 pub fn insecure_client_config() -> anyhow::Result<ClientConfig> {
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
+
+    // Enable 0-RTT early data so reconnections skip the handshake
+    crypto.enable_early_data = true;
 
     let quic_crypto = QuicClientConfig::try_from(crypto)?;
     Ok(ClientConfig::new(Arc::new(quic_crypto)))

@@ -21,7 +21,35 @@ impl AgentTunnel {
 
         // QUIC connect to the relay server on port 5000
         let server_addr = format!("{}:5000", server_ip);
-        let quic = endpoint.connect(server_addr.parse()?, "localhost")?.await?;
+        let connecting = endpoint.connect(server_addr.parse()?, "localhost")?;
+
+        // Try 0-RTT (works on reconnections when we have a cached session ticket)
+        let quic = match connecting.into_0rtt() {
+            Ok((conn, zero_rtt_accepted)) => {
+                info!(
+                    "0-RTT connection attempt to {} (pending acceptance)",
+                    server_addr
+                );
+                // Spawn a task to log whether the server accepted our 0-RTT data
+                tokio::spawn(async move {
+                    let accepted = zero_rtt_accepted.await;
+                    if accepted {
+                        info!("Server accepted 0-RTT data!");
+                    } else {
+                        info!("Server rejected 0-RTT data (fell back to 1-RTT)");
+                    }
+                });
+                conn
+            }
+            Err(connecting) => {
+                // First connection or no session ticket — do a full handshake
+                info!(
+                    "No cached session, performing full QUIC handshake to {}",
+                    server_addr
+                );
+                connecting.await?
+            }
+        };
         info!("QUIC connection established to {}", server_addr);
 
         // Open the first bi-stream as the control channel
