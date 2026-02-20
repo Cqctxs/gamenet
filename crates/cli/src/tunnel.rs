@@ -21,7 +21,19 @@ impl AgentTunnel {
 
         // QUIC connect to the relay server on port 5000
         let server_addr = format!("{}:5000", server_ip);
-        let connecting = endpoint.connect(server_addr.parse()?, "localhost")?;
+
+        // Try parsing as a raw SocketAddr first (zero overhead for IPs),
+        // only do DNS resolution if it's a hostname.
+        let resolved: std::net::SocketAddr = match server_addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&server_addr)
+                .await?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Could not resolve {}", server_addr))?,
+        };
+        info!("Connecting to {}", resolved);
+
+        let connecting = endpoint.connect(resolved, "localhost")?;
 
         // Try 0-RTT (works on reconnections when we have a cached session ticket)
         let quic = match connecting.into_0rtt() {
