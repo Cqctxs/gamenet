@@ -12,7 +12,27 @@ pub struct RelayServer {
 
 impl RelayServer {
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
-        let (server_config, _cert) = gamenet_core::crypto::server_config()?;
+        let server_config = match (
+            std::env::var("GAMENET_TLS_CERT"),
+            std::env::var("GAMENET_TLS_KEY"),
+        ) {
+            (Ok(cert_path), Ok(key_path)) => {
+                info!("Loading TLS cert from {}", cert_path);
+                gamenet_core::crypto::server_config_from_files(
+                    std::path::Path::new(&cert_path),
+                    std::path::Path::new(&key_path),
+                )?
+            }
+            _ => {
+                warn!(
+                    "GAMENET_TLS_CERT / GAMENET_TLS_KEY not set — \
+                     using self-signed cert (development mode only)"
+                );
+                let (cfg, _cert) = gamenet_core::crypto::server_config()?;
+                cfg
+            }
+        };
+
         let endpoint = Endpoint::server(server_config, addr.parse()?)?;
         info!("QUIC relay server listening on {}", addr);
         let state = ServerState::load_or_new("./gamenet-state.json");
