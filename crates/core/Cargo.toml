@@ -13,3 +13,5 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 bytes = { workspace = true }
 getrandom = "0.2"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
