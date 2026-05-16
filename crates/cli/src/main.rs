@@ -28,9 +28,13 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
 
-        /// Relay server address (for development/testing)
-        #[arg(long, default_value = "localhost", hide = true)]
+        /// Relay server hostname
+        #[arg(long, default_value = "relay.0verclock.tech", hide = true)]
         server: String,
+
+        /// Skip TLS certificate verification (development only)
+        #[arg(long, default_value_t = false, hide = true)]
+        insecure: bool,
     },
 }
 
@@ -40,11 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Host { game, port, server } => {
+        Commands::Host { game, port, server, insecure } => {
             let local_port = match (&game, port) {
-                // Explicit --port always wins
                 (_, Some(p)) => p,
-                // Look up game preset
                 (Some(name), None) => {
                     let preset = presets::find_preset(name).ok_or_else(|| {
                         let available: Vec<&str> =
@@ -62,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
                     );
                     preset.default_port
                 }
-                // Neither game nor port
                 (None, None) => {
                     let available: Vec<&str> = presets::PRESETS.iter().map(|p| p.name).collect();
                     anyhow::bail!(
@@ -76,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let mut tunnel = AgentTunnel::connect(&server, local_port).await?;
+            let mut tunnel = AgentTunnel::connect(&server, local_port, insecure).await?;
             tunnel.run().await
         }
     }

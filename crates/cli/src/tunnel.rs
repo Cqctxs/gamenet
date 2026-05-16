@@ -12,14 +12,28 @@ pub struct AgentTunnel {
 }
 
 impl AgentTunnel {
-    pub async fn connect(server_ip: &str, local_port: u16) -> anyhow::Result<Self> {
+    /// Connect to the relay server.
+    ///
+    /// `server_hostname` is used both for DNS resolution and as the TLS SNI
+    /// name, so it must match the server's certificate (e.g. `relay.0verclock.tech`).
+    /// Set `insecure = true` only for local development against a self-signed cert.
+    pub async fn connect(
+        server_hostname: &str,
+        local_port: u16,
+        insecure: bool,
+    ) -> anyhow::Result<Self> {
         let token = identity::load_or_create()?;
 
-        let client_config = crypto::insecure_client_config()?;
+        let client_config = if insecure {
+            crypto::insecure_client_config()?
+        } else {
+            crypto::client_config()?
+        };
+
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
 
-        let server_addr = format!("{}:5000", server_ip);
+        let server_addr = format!("{}:5000", server_hostname);
         let resolved: std::net::SocketAddr = match server_addr.parse() {
             Ok(addr) => addr,
             Err(_) => tokio::net::lookup_host(&server_addr)
@@ -27,12 +41,14 @@ impl AgentTunnel {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("Could not resolve {}", server_addr))?,
         };
-        info!("Connecting to {}", resolved);
+        info!("Connecting to {} ({})", server_hostname, resolved);
 
-        let connecting = endpoint.connect(resolved, "localhost")?;
+        // SNI must be the hostname, not the IP, for cert validation to work
+        let connecting = endpoint.connect(resolved, server_hostname)?;
+
         let quic = match connecting.into_0rtt() {
             Ok((conn, zero_rtt_accepted)) => {
-                info!("0-RTT connection attempt to {}", server_addr);
+                info!("0-RTT connection attempt to {}", server_hostname);
                 tokio::spawn(async move {
                     if zero_rtt_accepted.await {
                         info!("Server accepted 0-RTT data");
@@ -43,11 +59,11 @@ impl AgentTunnel {
                 conn
             }
             Err(connecting) => {
-                info!("Full QUIC handshake to {}", server_addr);
+                info!("Full QUIC handshake to {}", server_hostname);
                 connecting.await?
             }
         };
-        info!("QUIC connection established to {}", server_addr);
+        info!("QUIC connection established to {}", server_hostname);
 
         let (mut ctrl_send, mut ctrl_recv) = quic.open_bi().await?;
 
@@ -70,7 +86,7 @@ impl AgentTunnel {
                 info!("===========================================");
                 info!("  TUNNEL IS LIVE!");
                 info!("  Tell players to connect to:");
-                info!("    {}:{}", server_ip, public_port);
+                info!("    {}:{}", server_hostname, public_port);
                 info!("  (This port is permanently yours — share it once)");
                 info!("===========================================");
             }
@@ -148,5 +164,10 @@ mod tests {
         let t2 = identity::load_or_create_at(&path).unwrap();
         assert_eq!(t1, t2);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verified_client_config_builds() {
+        assert!(gamenet_core::crypto::client_config().is_ok());
     }
 }
