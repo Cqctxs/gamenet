@@ -35,10 +35,11 @@ impl Tunnel {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent disconnected before registering"))?;
 
-        let ControlMessage::Register { local_port, .. } = msg else {
+        let ControlMessage::Register { local_port, token, .. } = msg else {
             warn!("Expected Register, got {:?}", msg);
             anyhow::bail!("Invalid first message");
         };
+        let _ = token; // Used in Task 6 when ServerState is overhauled
 
         let public_port = state.lock().await.assign_port(local_port);
         send_msg(&mut ctrl_send, &ControlMessage::TunnelReady { public_port }).await?;

@@ -68,11 +68,13 @@ impl AgentTunnel {
         let (mut ctrl_send, mut ctrl_recv) = quic.open_bi().await?;
 
         // Send registration
+        // Temporary placeholder — replaced with real identity in Task 8
         send_msg(
             &mut ctrl_send,
             &ControlMessage::Register {
                 protocol: Protocol::Tcp,
                 local_port,
+                token: [0u8; 32],
             },
         )
         .await?;
