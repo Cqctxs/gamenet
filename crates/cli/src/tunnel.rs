@@ -1,29 +1,25 @@
-﻿use crate::bridge;
+use crate::bridge;
 use gamenet_core::crypto;
+use gamenet_core::identity;
 use gamenet_core::message::{recv_msg, send_msg};
 use gamenet_core::protocol::{ControlMessage, Protocol};
 use quinn::{Connection, Endpoint};
 use tracing::{error, info};
 
-/// The agent-side tunnel that connects to the relay server via QUIC.
 pub struct AgentTunnel {
     quic: Connection,
     local_port: u16,
 }
 
 impl AgentTunnel {
-    /// Connect to the relay server over QUIC and register a tunnel.
     pub async fn connect(server_ip: &str, local_port: u16) -> anyhow::Result<Self> {
-        // Build an insecure client config (dev: self-signed certs)
+        let token = identity::load_or_create()?;
+
         let client_config = crypto::insecure_client_config()?;
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
 
-        // QUIC connect to the relay server on port 5000
         let server_addr = format!("{}:5000", server_ip);
-
-        // Try parsing as a raw SocketAddr first (zero overhead for IPs),
-        // only do DNS resolution if it's a hostname.
         let resolved: std::net::SocketAddr = match server_addr.parse() {
             Ok(addr) => addr,
             Err(_) => tokio::net::lookup_host(&server_addr)
@@ -34,52 +30,37 @@ impl AgentTunnel {
         info!("Connecting to {}", resolved);
 
         let connecting = endpoint.connect(resolved, "localhost")?;
-
-        // Try 0-RTT (works on reconnections when we have a cached session ticket)
         let quic = match connecting.into_0rtt() {
             Ok((conn, zero_rtt_accepted)) => {
-                info!(
-                    "0-RTT connection attempt to {} (pending acceptance)",
-                    server_addr
-                );
-                // Spawn a task to log whether the server accepted our 0-RTT data
+                info!("0-RTT connection attempt to {}", server_addr);
                 tokio::spawn(async move {
-                    let accepted = zero_rtt_accepted.await;
-                    if accepted {
-                        info!("Server accepted 0-RTT data!");
+                    if zero_rtt_accepted.await {
+                        info!("Server accepted 0-RTT data");
                     } else {
-                        info!("Server rejected 0-RTT data (fell back to 1-RTT)");
+                        info!("Server rejected 0-RTT (fell back to 1-RTT)");
                     }
                 });
                 conn
             }
             Err(connecting) => {
-                // First connection or no session ticket — do a full handshake
-                info!(
-                    "No cached session, performing full QUIC handshake to {}",
-                    server_addr
-                );
+                info!("Full QUIC handshake to {}", server_addr);
                 connecting.await?
             }
         };
         info!("QUIC connection established to {}", server_addr);
 
-        // Open the first bi-stream as the control channel
         let (mut ctrl_send, mut ctrl_recv) = quic.open_bi().await?;
 
-        // Send registration
-        // Temporary placeholder — replaced with real identity in Task 8
         send_msg(
             &mut ctrl_send,
             &ControlMessage::Register {
                 protocol: Protocol::Tcp,
                 local_port,
-                token: [0u8; 32],
+                token,
             },
         )
         .await?;
 
-        // Wait for confirmation
         let msg = recv_msg(&mut ctrl_recv)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Server closed before confirming tunnel"))?;
@@ -90,6 +71,7 @@ impl AgentTunnel {
                 info!("  TUNNEL IS LIVE!");
                 info!("  Tell players to connect to:");
                 info!("    {}:{}", server_ip, public_port);
+                info!("  (This port is permanently yours — share it once)");
                 info!("===========================================");
             }
             ControlMessage::Error { message } => {
@@ -100,7 +82,6 @@ impl AgentTunnel {
             }
         }
 
-        // Spawn a task to listen for control messages (NewConnection notifications)
         tokio::spawn(async move {
             if let Err(e) = Self::handle_control_messages(ctrl_recv).await {
                 error!("Control channel error: {}", e);
@@ -110,29 +91,24 @@ impl AgentTunnel {
         Ok(Self { quic, local_port })
     }
 
-    /// Listen for control messages from the server (informational only).
     async fn handle_control_messages(mut ctrl_recv: quinn::RecvStream) -> anyhow::Result<()> {
         loop {
-            let msg = match recv_msg(&mut ctrl_recv).await? {
-                Some(m) => m,
+            match recv_msg(&mut ctrl_recv).await? {
+                Some(ControlMessage::NewConnection { stream_id }) => {
+                    info!("Player #{} joined! Accepting QUIC stream...", stream_id);
+                }
+                Some(_) => {}
                 None => {
                     info!("Control channel closed by server.");
                     break;
                 }
-            };
-
-            if let ControlMessage::NewConnection { stream_id } = msg {
-                info!("Player #{} joined! Accepting QUIC stream...", stream_id);
             }
         }
         Ok(())
     }
 
-    /// Accept new QUIC bi-streams opened by the server (one per player)
-    /// and bridge each one to the local game.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            // The server opens a new bi-stream for each player
             let (quic_send, quic_recv) = match self.quic.accept_bi().await {
                 Ok(streams) => streams,
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
@@ -153,5 +129,24 @@ impl AgentTunnel {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gamenet_core::identity;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn identity_is_stable_across_calls() {
+        let ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let path = std::env::temp_dir().join(format!("cli-id-{}.bin", ns));
+        let t1 = identity::load_or_create_at(&path).unwrap();
+        let t2 = identity::load_or_create_at(&path).unwrap();
+        assert_eq!(t1, t2);
+        std::fs::remove_file(&path).ok();
     }
 }

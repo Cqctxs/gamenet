@@ -29,7 +29,7 @@ enum Commands {
         port: Option<u16>,
 
         /// Relay server address (for development/testing)
-        #[arg(long, default_value = "", hide = true)]
+        #[arg(long, default_value = "localhost", hide = true)]
         server: String,
     },
 }
