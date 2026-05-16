@@ -15,3 +15,4 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 bytes = { workspace = true }
 gamenet-core = { path = "../core" }
+serde_json = "1"
