@@ -1,4 +1,5 @@
 mod bridge;
+mod host_admission;
 mod lease;
 mod lease_store;
 mod relay;

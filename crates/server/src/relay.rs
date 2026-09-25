@@ -7,10 +7,12 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info, warn};
 
+use crate::host_admission::PendingByIp;
 use crate::state::{ServerState, now_ms};
 use crate::tunnel::Tunnel;
 
 const PENDING_LIMIT: usize = 128;
+const PENDING_PER_IP_LIMIT: usize = 4;
 const GLOBAL_PLAYER_LIMIT: usize = 2000;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -18,6 +20,7 @@ pub struct RelayServer {
     state: Arc<Mutex<ServerState>>,
     endpoint: Endpoint,
     pending: Arc<Semaphore>,
+    pending_by_ip: Arc<PendingByIp>,
     global_players: Arc<Semaphore>,
 }
 
@@ -52,6 +55,7 @@ impl RelayServer {
             state: Arc::new(Mutex::new(state)),
             endpoint,
             pending: Arc::new(Semaphore::new(PENDING_LIMIT)),
+            pending_by_ip: Arc::new(PendingByIp::new(PENDING_PER_IP_LIMIT)),
             global_players: Arc::new(Semaphore::new(GLOBAL_PLAYER_LIMIT)),
         })
     }
@@ -76,6 +80,10 @@ impl RelayServer {
                             continue;
                         }
                     };
+                    let Some(ip_permit) = self.pending_by_ip.try_acquire(address.ip()) else {
+                        incoming.refuse();
+                        continue;
+                    };
                     let state = Arc::clone(&self.state);
                     let players = Arc::clone(&self.global_players);
                     tokio::spawn(async move {
@@ -83,7 +91,7 @@ impl RelayServer {
                             let connection = incoming.accept()?.await?;
                             Tunnel::from_quic(connection, state, address.ip(), players).await
                         }).await;
-                        drop(permit);
+                        drop((permit, ip_permit));
                         match registration {
                             Ok(Ok(mut tunnel)) => {
                                 if let Err(error) = tunnel.run().await {
@@ -220,6 +228,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn third_idle_host_from_one_ip_cannot_reserve_a_port() {
+        let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(
+            RelayServer::bind_with_state_path("127.0.0.1:0", &dir.path().join("state.json"))
+                .await
+                .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+
+        let (first, _, first_response) = register(&endpoint, address, [21; 32], Protocol::Tcp)
+            .await
+            .unwrap();
+        let (second, _, second_response) = register(&endpoint, address, [22; 32], Protocol::Tcp)
+            .await
+            .unwrap();
+        assert!(matches!(first_response, ControlMessage::TunnelReady { .. }));
+        assert!(matches!(
+            second_response,
+            ControlMessage::TunnelReady { .. }
+        ));
+        let (_, _, third_response) = register(&endpoint, address, [23; 32], Protocol::Tcp)
+            .await
+            .unwrap();
+        assert!(
+            matches!(third_response, ControlMessage::Error { message } if message.contains("Too many tunnels"))
+        );
+        first.close(0u8.into(), b"test shutdown");
+        second.close(0u8.into(), b"test shutdown");
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn udp_registration_is_rejected_without_reserving_a_port() {
         let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -337,6 +383,57 @@ mod tests {
         })
         .await
         .unwrap();
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn one_host_ip_cannot_fill_all_pending_registration_slots() {
+        let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(
+            RelayServer::bind_with_state_path("127.0.0.1:0", &dir.path().join("state.json"))
+                .await
+                .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+
+        let mut idle = Vec::new();
+        for _ in 0..PENDING_PER_IP_LIMIT {
+            idle.push(
+                endpoint
+                    .connect(address, "localhost")
+                    .unwrap()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let ip = "127.0.0.1".parse().unwrap();
+        assert_eq!(server.pending_by_ip.active_for(ip), PENDING_PER_IP_LIMIT);
+        assert_eq!(
+            server.pending.available_permits(),
+            PENDING_LIMIT - PENDING_PER_IP_LIMIT
+        );
+        let refused = tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.connect(address, "localhost").unwrap(),
+        )
+        .await;
+        assert!(!matches!(refused, Ok(Ok(_))));
+
+        idle.pop().unwrap().close(0u8.into(), b"test disconnect");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.pending_by_ip.active_for(ip) != PENDING_PER_IP_LIMIT - 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let resumed = endpoint.connect(address, "localhost").unwrap().await;
+        assert!(resumed.is_ok());
         server.close();
         task.await.unwrap().unwrap();
     }

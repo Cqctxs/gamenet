@@ -3,9 +3,11 @@ use std::net::IpAddr;
 
 use gamenet_core::identity::TunnelToken;
 
+use crate::host_admission::HostSource;
+
 pub const PORT_START: u16 = 10000;
 pub const PORT_END: u16 = 10999;
-pub const MAX_TUNNELS_PER_IP: usize = 5;
+pub const MAX_TUNNELS_PER_IP: usize = 2;
 pub const GRACE_MS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -65,7 +67,10 @@ impl LeaseTable {
                 matches!(lease.status, LeaseStatus::Grace { .. }),
                 "This identity already has an active tunnel"
             );
-            self.check_ip_quota(peer_ip, lease.last_ip == Some(peer_ip))?;
+            self.check_ip_quota(
+                peer_ip,
+                lease.last_ip.map(HostSource::from) == Some(HostSource::from(peer_ip)),
+            )?;
             return Ok(vec![lease.port]);
         }
         self.check_ip_quota(peer_ip, false)?;
@@ -187,10 +192,11 @@ impl LeaseTable {
     }
 
     fn check_ip_quota(&self, peer_ip: IpAddr, already_counted: bool) -> anyhow::Result<()> {
+        let source = HostSource::from(peer_ip);
         let count = self
             .leases
             .values()
-            .filter(|lease| lease.last_ip == Some(peer_ip))
+            .filter(|lease| lease.last_ip.map(HostSource::from) == Some(source))
             .count();
         anyhow::ensure!(
             already_counted || count < MAX_TUNNELS_PER_IP,
@@ -252,7 +258,7 @@ mod tests {
         let mut table = LeaseTable::new();
         let old_ip = ip("192.0.2.1");
         let new_ip = ip("192.0.2.2");
-        for n in 0..5 {
+        for n in 0..2 {
             let token = TokenId::from_token(&[n; 32]);
             let port = table.candidate_ports(token, old_ip, 0).unwrap()[0];
             let session = table.activate(token, old_ip, port, 0).unwrap();
@@ -270,6 +276,49 @@ mod tests {
             table
                 .candidate_ports(TokenId::from_token(&[99; 32]), old_ip, 3)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn two_idle_hosts_from_one_ip_block_a_third_until_a_lease_expires() {
+        let mut table = LeaseTable::new();
+        let host = ip("192.0.2.1");
+        let first = TokenId::from_token(&[1; 32]);
+        let second = TokenId::from_token(&[2; 32]);
+        let third = TokenId::from_token(&[3; 32]);
+        let first_port = table.candidate_ports(first, host, 0).unwrap()[0];
+        let first_session = table.activate(first, host, first_port, 0).unwrap();
+        let second_port = table.candidate_ports(second, host, 0).unwrap()[0];
+        table.activate(second, host, second_port, 0).unwrap();
+
+        assert!(table.candidate_ports(third, host, 0).is_err());
+        assert!(table.end(first, first_session, 1));
+        assert!(table.candidate_ports(third, host, 1).is_err());
+        assert!(table.candidate_ports(first, host, 1).is_ok());
+        assert!(table.candidate_ports(third, host, GRACE_MS + 1).is_ok());
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_network_share_the_host_quota() {
+        let mut table = LeaseTable::new();
+        let first_ip = ip("2001:db8:1:2::1");
+        let second_ip = ip("2001:db8:1:2::2");
+        let rotating_ip = ip("2001:db8:1:2::3");
+        let other_network = ip("2001:db8:1:3::1");
+        let first = TokenId::from_token(&[11; 32]);
+        let second = TokenId::from_token(&[12; 32]);
+        let third = TokenId::from_token(&[13; 32]);
+        let first_port = table.candidate_ports(first, first_ip, 0).unwrap()[0];
+        let first_session = table.activate(first, first_ip, first_port, 0).unwrap();
+        let second_port = table.candidate_ports(second, second_ip, 0).unwrap()[0];
+        table.activate(second, second_ip, second_port, 0).unwrap();
+
+        assert!(table.candidate_ports(third, rotating_ip, 0).is_err());
+        assert!(table.candidate_ports(third, other_network, 0).is_ok());
+        assert!(table.end(first, first_session, 0));
+        assert_eq!(
+            table.candidate_ports(first, rotating_ip, 1).unwrap(),
+            vec![first_port]
         );
     }
 
