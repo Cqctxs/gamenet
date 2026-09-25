@@ -7,6 +7,8 @@
 
 The relay permits two active or reconnect-window host leases and four pending registrations per IPv4 address or IPv6 `/64` network. Pending registrations also have a global cap of 128 and a ten-second deadline. A live host can wait indefinitely for players; these quotas are address-based admission controls, not an identity or account system.
 
+The host keeps its ordinary 32-byte identity token and a separate 32-byte recovery key in private files on Unix and Windows. Registration enrolls only a hash of the recovery key; reconnecting with the ordinary token cannot change an enrolled recovery key. A recovery request proves knowledge of the key over verified QUIC, durably transfers the live claim to a new ordinary token, and closes any displaced QUIC connection. Routine rotation transfers a disconnected claim without the recovery key and is limited to once per lease. The persisted lease records retired token fingerprints and the recovery fingerprint; these disappear when the five-minute claim expires. Recovery protects a claim from theft of the ordinary identity alone, but the public anonymous relay cannot ban a person from opening a new unrelated tunnel.
+
 ---
 
 ## 1. System Overview
