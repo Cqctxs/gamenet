@@ -5,6 +5,48 @@ use gamenet_core::message::{recv_msg, send_msg};
 use gamenet_core::protocol::{ControlMessage, Protocol};
 use support::{LocalEndpoints, TEST_TIMEOUT, assert_certificate_rejection, certificates};
 
+fn conventional_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    use rustls::crypto::aws_lc_rs;
+
+    std::sync::Arc::new(rustls::crypto::CryptoProvider {
+        kx_groups: vec![aws_lc_rs::kx_group::X25519],
+        ..aws_lc_rs::default_provider()
+    })
+}
+
+fn conventional_client(roots: rustls::RootCertStore) -> quinn::ClientConfig {
+    use quinn::crypto::rustls::QuicClientConfig;
+    use std::sync::Arc;
+
+    let tls = rustls::ClientConfig::builder_with_provider(conventional_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()))
+}
+
+fn conventional_server() -> (quinn::ServerConfig, rustls::RootCertStore) {
+    use quinn::crypto::rustls::QuicServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert);
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let tls = rustls::ServerConfig::builder_with_provider(conventional_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key.into())
+        .unwrap();
+    let server =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).unwrap();
+    (server, roots)
+}
+
 #[tokio::test]
 async fn control_messages_round_trip_over_verified_quic() {
     let (server_config, roots) = certificates(false);
@@ -86,4 +128,47 @@ async fn expired_certificate_from_a_trusted_issuer_is_rejected() {
     let endpoints = LocalEndpoints::new(server, crypto::client_config_with_roots(roots).unwrap());
     let (client, _) = endpoints.connect("localhost").await;
     assert_certificate_rejection(client, "expired");
+}
+
+#[tokio::test]
+async fn hybrid_relay_rejects_conventional_only_client() {
+    let (server, roots) = certificates(false);
+    let endpoints = LocalEndpoints::new(server, conventional_client(roots));
+    let (client, _) = endpoints.connect("localhost").await;
+    assert!(
+        client.is_err(),
+        "conventional-only client unexpectedly connected"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_client_rejects_conventional_only_relay() {
+    let (server, roots) = conventional_server();
+    let endpoints = LocalEndpoints::new(server, crypto::client_config_with_roots(roots).unwrap());
+    let (client, _) = endpoints.connect("localhost").await;
+    assert!(
+        client.is_err(),
+        "hybrid client used a conventional fallback"
+    );
+}
+
+#[tokio::test]
+async fn development_relay_also_rejects_conventional_only_client() {
+    let (server, cert) = crypto::server_config().unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let endpoints = LocalEndpoints::new(server, conventional_client(roots));
+    let (client, _) = endpoints.connect("localhost").await;
+    assert!(
+        client.is_err(),
+        "development relay accepted conventional TLS"
+    );
+}
+
+#[tokio::test]
+async fn insecure_development_client_still_requires_hybrid_exchange() {
+    let (server, _) = conventional_server();
+    let endpoints = LocalEndpoints::new(server, crypto::insecure_client_config().unwrap());
+    let (client, _) = endpoints.connect("localhost").await;
+    assert!(client.is_err(), "insecure client accepted conventional TLS");
 }

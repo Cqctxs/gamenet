@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::Endpoint;
+use quinn::{Endpoint, ServerConfig};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info, warn};
@@ -16,6 +16,27 @@ const PENDING_PER_IP_LIMIT: usize = 4;
 const GLOBAL_PLAYER_LIMIT: usize = 2000;
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn tls_server_config(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    development_self_signed: bool,
+) -> anyhow::Result<ServerConfig> {
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            info!("Loading TLS cert from {}", cert.display());
+            gamenet_core::crypto::server_config_from_files(cert, key)
+        }
+        (None, None) if development_self_signed => {
+            warn!("Using a self-signed development certificate");
+            Ok(gamenet_core::crypto::server_config()?.0)
+        }
+        (None, None) => anyhow::bail!(
+            "Set GAMENET_TLS_CERT and GAMENET_TLS_KEY for production, or GAMENET_DEV_SELF_SIGNED=1 for local development"
+        ),
+        _ => anyhow::bail!("GAMENET_TLS_CERT and GAMENET_TLS_KEY must both be set"),
+    }
+}
+
 pub struct RelayServer {
     state: Arc<Mutex<ServerState>>,
     endpoint: Endpoint,
@@ -26,28 +47,29 @@ pub struct RelayServer {
 
 impl RelayServer {
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
-        Self::bind_with_state_path(addr, Path::new("./gamenet-state.json")).await
+        let cert_path = std::env::var_os("GAMENET_TLS_CERT").map(PathBuf::from);
+        let key_path = std::env::var_os("GAMENET_TLS_KEY").map(PathBuf::from);
+        let development_self_signed =
+            std::env::var("GAMENET_DEV_SELF_SIGNED").as_deref() == Ok("1");
+        let config = tls_server_config(
+            cert_path.as_deref(),
+            key_path.as_deref(),
+            development_self_signed,
+        )?;
+        Self::bind_with_config_and_state_path(addr, Path::new("./gamenet-state.json"), config).await
     }
 
+    #[cfg(test)]
     pub async fn bind_with_state_path(addr: &str, state_path: &Path) -> anyhow::Result<Self> {
-        let server_config = match (
-            std::env::var("GAMENET_TLS_CERT"),
-            std::env::var("GAMENET_TLS_KEY"),
-        ) {
-            (Ok(cert_path), Ok(key_path)) => {
-                info!("Loading TLS cert from {}", cert_path);
-                gamenet_core::crypto::server_config_from_files(
-                    Path::new(&cert_path),
-                    Path::new(&key_path),
-                )?
-            }
-            _ => {
-                warn!(
-                    "TLS certificate/key not both set; using self-signed development certificate"
-                );
-                gamenet_core::crypto::server_config()?.0
-            }
-        };
+        let config = tls_server_config(None, None, true)?;
+        Self::bind_with_config_and_state_path(addr, state_path, config).await
+    }
+
+    async fn bind_with_config_and_state_path(
+        addr: &str,
+        state_path: &Path,
+        server_config: ServerConfig,
+    ) -> anyhow::Result<Self> {
         let state = ServerState::load_or_new(state_path, now_ms())?;
         let endpoint = Endpoint::server(server_config, addr.parse()?)?;
         info!("QUIC relay server listening on {}", endpoint.local_addr()?);
@@ -127,6 +149,17 @@ mod tests {
     use gamenet_core::message::{recv_msg, send_msg};
     use gamenet_core::protocol::{ControlMessage, Protocol};
     use quinn::{Connection, Endpoint};
+
+    #[test]
+    fn production_tls_requires_a_complete_certificate_pair() {
+        let missing = Path::new("/nonexistent/gamenet.pem");
+        assert!(tls_server_config(None, None, false).is_err());
+        assert!(tls_server_config(Some(missing), None, false).is_err());
+        assert!(tls_server_config(None, Some(missing), false).is_err());
+        assert!(tls_server_config(Some(missing), Some(missing), false).is_err());
+        assert!(tls_server_config(Some(missing), None, true).is_err());
+        assert!(tls_server_config(None, None, true).is_ok());
+    }
 
     async fn register(
         endpoint: &Endpoint,
@@ -386,6 +419,7 @@ mod tests {
         server.close();
         task.await.unwrap().unwrap();
     }
+
     #[tokio::test]
     async fn one_host_ip_cannot_fill_all_pending_registration_slots() {
         let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;

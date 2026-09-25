@@ -3,7 +3,7 @@
 **Project Goal:** A high-performance gaming tunnel written in Rust.  
 **Core differentiator:** TCP game traffic is carried over QUIC rather than another TCP tunnel. UDP game forwarding remains a planned feature.
 
-**Current implementation:** TCP game tunnels only. The relay-to-agent link uses QUIC and TLS; the player-to-relay TCP hop is not encrypted by GameNet. The relay binds an available TCP port in `10000..=10999`, holds it for five minutes after disconnect, and the CLI retries lost connections. UDP forwarding and QUIC 0-RTT are future work. Sections below describing UDP are design goals, not shipped features.
+**Current implementation:** TCP game tunnels only. The relay-to-agent link uses QUIC with TLS 1.3 and requires the `X25519MLKEM768` hybrid key-exchange group on both sides. Certificate authentication is still conventional, and the player-to-relay TCP hop is not encrypted by GameNet. The relay binds an available TCP port in `10000..=10999`, holds it for five minutes after disconnect, and the CLI retries lost connections. UDP forwarding and QUIC 0-RTT are future work. Sections below describing UDP are design goals, not shipped features.
 
 The relay permits two active or reconnect-window host leases and four pending registrations per IPv4 address or IPv6 `/64` network. Pending registrations also have a global cap of 128 and a ten-second deadline. A live host can wait indefinitely for players; these quotas are address-based admission controls, not an identity or account system.
 
