@@ -7,7 +7,8 @@ use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
 use rustls::client::danger;
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 
 // ── Server-side: self-signed cert (development only) ─────────────────────────
 
@@ -19,7 +20,6 @@ pub fn server_config() -> anyhow::Result<(ServerConfig, CertificateDer<'static>)
     let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der.into())?;
     let transport = Arc::get_mut(&mut server_config.transport).unwrap();
     transport.max_concurrent_bidi_streams(128u8.into());
-
     Ok((server_config, cert_der))
 }
 
@@ -32,20 +32,22 @@ pub fn server_config_from_files(cert_path: &Path, key_path: &Path) -> anyhow::Re
     let key_pem = std::fs::read(key_path)
         .map_err(|e| anyhow::anyhow!("Cannot read key {:?}: {}", key_path, e))?;
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to parse cert PEM: {}", e))?;
 
-    anyhow::ensure!(!certs.is_empty(), "No certificates found in {:?}", cert_path);
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "No certificates found in {:?}",
+        cert_path
+    );
 
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| anyhow::anyhow!("Failed to parse key PEM: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {:?}", key_path))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| anyhow::anyhow!("Failed to parse key PEM: {}", e))?;
 
     let mut server_config = ServerConfig::with_single_cert(certs, key)?;
     let transport = Arc::get_mut(&mut server_config.transport).unwrap();
     transport.max_concurrent_bidi_streams(128u8.into());
-
     Ok(server_config)
 }
 
@@ -57,10 +59,15 @@ pub fn client_config() -> anyhow::Result<ClientConfig> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let mut crypto = rustls::ClientConfig::builder()
+    client_config_with_roots(roots)
+}
+
+/// Build a verified client config using an explicit set of trusted roots.
+/// This supports private certificate authorities without disabling verification.
+pub fn client_config_with_roots(roots: rustls::RootCertStore) -> anyhow::Result<ClientConfig> {
+    let crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    crypto.enable_early_data = true; // preserve QUIC 0-RTT on reconnections
     let quic_crypto = QuicClientConfig::try_from(crypto)?;
     Ok(ClientConfig::new(Arc::new(quic_crypto)))
 }
@@ -69,11 +76,10 @@ pub fn client_config() -> anyhow::Result<ClientConfig> {
 ///
 /// ⚠️  Development only — use only with `--insecure` flag against a local server.
 pub fn insecure_client_config() -> anyhow::Result<ClientConfig> {
-    let mut crypto = rustls::ClientConfig::builder()
+    let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
-    crypto.enable_early_data = true;
     let quic_crypto = QuicClientConfig::try_from(crypto)?;
     Ok(ClientConfig::new(Arc::new(quic_crypto)))
 }
@@ -107,7 +113,12 @@ impl danger::ServerCertVerifier for SkipServerVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<danger::HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -116,7 +127,12 @@ impl danger::ServerCertVerifier for SkipServerVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<danger::HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

@@ -18,11 +18,11 @@ pub async fn recv_msg<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> anyhow::Result<Option<ControlMessage>> {
     let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    // EOF is clean only between frames, not partway through a length prefix.
+    if reader.read(&mut len_buf[..1]).await? == 0 {
+        return Ok(None);
     }
+    reader.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_CONTROL_MSG_BYTES {
         return Err(anyhow::anyhow!(
@@ -37,17 +37,4 @@ pub async fn recv_msg<R: AsyncReadExt + Unpin>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::duplex;
-
-    #[tokio::test]
-    async fn recv_msg_rejects_oversized_length() {
-        let (mut writer, mut reader) = duplex(1024);
-        writer.write_all(&200_000_u32.to_be_bytes()).await.unwrap();
-        drop(writer);
-
-        let err = recv_msg(&mut reader).await.unwrap_err();
-        assert!(err.to_string().contains("too large"), "got: {}", err);
-    }
-}
+mod tests;

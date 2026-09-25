@@ -16,3 +16,5 @@ rcgen = { workspace = true }
 bytes = { workspace = true }
 gamenet-core = { path = "../core" }
 serde_json = "1"
+ring = "0.17"
+tempfile = "3"

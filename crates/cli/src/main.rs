@@ -3,6 +3,8 @@ mod tunnel;
 
 use clap::{Parser, Subcommand};
 use gamenet_core::presets;
+use gamenet_core::protocol::Protocol;
+use tracing::warn;
 use tunnel::AgentTunnel;
 
 #[derive(Parser)]
@@ -19,7 +21,7 @@ struct Cli {
 enum Commands {
     /// Host a game server through the relay
     ///
-    /// Supported games: minecraft, bedrock, valheim, terraria, factorio
+    /// Supported TCP games: minecraft, terraria
     Host {
         /// Game name (e.g. "minecraft") or omit and use --port
         game: Option<String>,
@@ -44,41 +46,78 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Host { game, port, server, insecure } => {
-            let local_port = match (&game, port) {
-                (_, Some(p)) => p,
-                (Some(name), None) => {
-                    let preset = presets::find_preset(name).ok_or_else(|| {
-                        let available: Vec<&str> =
-                            presets::PRESETS.iter().map(|p| p.name).collect();
-                        anyhow::anyhow!(
-                            "Unknown game '{}'. Available: {}\n\
-                             Or specify a port directly with: gamenet host --port <PORT>",
-                            name,
-                            available.join(", ")
-                        )
-                    })?;
-                    println!(
-                        "{} — using default port {}",
-                        preset.name, preset.default_port
-                    );
-                    preset.default_port
-                }
-                (None, None) => {
-                    let available: Vec<&str> = presets::PRESETS.iter().map(|p| p.name).collect();
-                    anyhow::bail!(
-                        "Please specify a game or port.\n\n\
-                         Usage:\n  \
-                         gamenet host minecraft\n  \
-                         gamenet host --port 7777\n\n\
-                         Supported games: {}",
-                        available.join(", ")
-                    );
-                }
-            };
-
+        Commands::Host {
+            game,
+            port,
+            server,
+            insecure,
+        } => {
+            let local_port = local_port_for(game.as_deref(), port)?;
             let mut tunnel = AgentTunnel::connect(&server, local_port, insecure).await?;
-            tunnel.run().await
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                if let Err(error) = tunnel.run().await {
+                    warn!("Tunnel disconnected: {error}");
+                }
+                loop {
+                    tokio::time::sleep(delay).await;
+                    match AgentTunnel::connect(&server, local_port, insecure).await {
+                        Ok(next) => {
+                            tunnel = next;
+                            delay = std::time::Duration::from_secs(1);
+                            break;
+                        }
+                        Err(error) => {
+                            warn!("Reconnect failed: {error}; retrying");
+                            delay = tunnel::next_retry_delay(delay);
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+fn local_port_for(game: Option<&str>, port: Option<u16>) -> anyhow::Result<u16> {
+    let preset = match game {
+        Some(name) => Some(presets::find_preset(name).ok_or_else(|| {
+            anyhow::anyhow!("Unknown game '{name}'. Try minecraft, terraria, or --port <PORT>")
+        })?),
+        None => None,
+    };
+    if let Some(preset) = preset {
+        anyhow::ensure!(
+            preset.protocol == Protocol::Tcp,
+            "{} requires UDP, which GameNet does not support yet",
+            preset.name
+        );
+    }
+    let local_port = port
+        .or_else(|| preset.map(|preset| preset.default_port))
+        .ok_or_else(|| anyhow::anyhow!("Specify a TCP game or --port <PORT>"))?;
+    anyhow::ensure!(local_port != 0, "Local port must be nonzero");
+    Ok(local_port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_only_presets_fail_even_with_port_override() {
+        assert!(
+            local_port_for(Some("bedrock"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("UDP")
+        );
+        assert!(
+            local_port_for(Some("valheim"), Some(2456))
+                .unwrap_err()
+                .to_string()
+                .contains("UDP")
+        );
+        assert_eq!(local_port_for(Some("minecraft"), None).unwrap(), 25565);
+        assert_eq!(local_port_for(None, Some(7777)).unwrap(), 7777);
     }
 }

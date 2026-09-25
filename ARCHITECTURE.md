@@ -1,7 +1,10 @@
 # GameNet: Architecture & Implementation Guide
 
 **Project Goal:** A high-performance gaming tunnel written in Rust.  
-**Core differentiator:** UDP-optimized tunneling that eliminates "TCP meltdown" lag for games.
+**Core differentiator:** TCP game traffic is carried over QUIC rather than another TCP tunnel. UDP game forwarding remains a planned feature.
+
+**Current implementation:** TCP game tunnels only. The relay-to-agent link uses QUIC and TLS; the player-to-relay TCP hop is not encrypted by GameNet. The relay binds an available TCP port in `10000..=10999`, holds it for five minutes after disconnect, and the CLI retries lost connections. UDP forwarding and QUIC 0-RTT are future work. Sections below describing UDP are design goals, not shipped features.
+
 
 ---
 
@@ -14,7 +17,7 @@ The system consists of three crates in a Cargo Workspace:
 | `gamenet-cli`    | Agent that forwards to localhost         | Your machine |
 | `gamenet-core`   | Shared protocol definitions              | Both         |
 
-**The Golden Rule:** The connection between Agent and Server is **always QUIC** via the `quinn` crate. This single connection carries control signals, TCP streams, and UDP datagrams simultaneously.
+**The Golden Rule:** The connection between Agent and Server is **always QUIC** via the `quinn` crate. It currently carries control signals and TCP streams.
 
 ---
 
@@ -36,7 +39,7 @@ QUIC runs over UDP and provides:
 - **Streams:** Independent reliable channels (no head-of-line blocking)
 - **Datagrams:** Unreliable fire-and-forget packets (perfect for UDP games)
 - **Built-in TLS:** Encryption is mandatory
-- **0-RTT Reconnection:** Fast reconnects after network hiccups
+- **Reconnects:** The CLI starts a new authenticated handshake after a lost connection; registration is never sent as replayable 0-RTT data.
 
 ---
 
@@ -44,7 +47,7 @@ QUIC runs over UDP and provides:
 
 ### Feature A: Hybrid Transport Engine (QUIC)
 
-**Goal:** Single encrypted tunnel supporting both reliable and unreliable traffic.
+**Goal:** One encrypted relay-to-agent connection carrying TCP streams today, with UDP datagrams planned.
 
 **Implementation:**
 
@@ -74,13 +77,13 @@ QUIC runs over UDP and provides:
 **Key code pattern:**
 
 ```rust
-// Bidirectional byte pumping
-tokio::io::copy_bidirectional(&mut stream_a, &mut stream_b).await?;
+// QUIC has separate send and receive halves. Each direction drains to EOF.
+gamenet_core::bridge::copy_halves(tcp_read, tcp_write, quic_recv, quic_send).await?;
 ```
 
 ---
 
-### Feature C: UDP Game Tunneling (Valheim, Bedrock, FPS)
+### Feature C: UDP Game Tunneling (planned; not implemented)
 
 **Flow:**
 
@@ -122,15 +125,13 @@ pub const PRESETS: &[GamePreset] = &[
 
 ---
 
-### Feature E: Connection Resumption
+### Feature E: Connection Resumption (planned)
 
 **Goal:** Survive brief network interruptions without dropping players.
 
 **Implementation:**
 
-- Store QUIC session tickets on the client
-- Use 0-RTT reconnection when connection drops
-- Server recognizes returning clients and resumes streams
+- The current CLI retries with a full authenticated handshake and reclaims its port within five minutes. Existing player streams do not survive a disconnect.
 
 ---
 
@@ -271,7 +272,7 @@ bytes = "1"
 ### Phase 4: Polish & Safety (Week 4-5)
 
 - [ ] Add game presets
-- [ ] Add connection resumption (0-RTT)
+- [ ] Evaluate replay-safe connection resumption
 - [ ] Add basic rate limiting
 - [ ] Add proper error handling and logging
 - [ ] Add graceful shutdown

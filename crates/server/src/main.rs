@@ -1,4 +1,6 @@
 mod bridge;
+mod lease;
+mod lease_store;
 mod relay;
 mod state;
 mod tunnel;

@@ -4,11 +4,19 @@ use gamenet_core::identity;
 use gamenet_core::message::{recv_msg, send_msg};
 use gamenet_core::protocol::{ControlMessage, Protocol};
 use quinn::{Connection, Endpoint};
+use std::time::Duration;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info};
 
 pub struct AgentTunnel {
     quic: Connection,
     local_port: u16,
+    control_task: JoinHandle<()>,
+    players: JoinSet<()>,
+}
+
+pub fn next_retry_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(Duration::from_secs(15))
 }
 
 impl AgentTunnel {
@@ -46,23 +54,7 @@ impl AgentTunnel {
         // SNI must be the hostname, not the IP, for cert validation to work
         let connecting = endpoint.connect(resolved, server_hostname)?;
 
-        let quic = match connecting.into_0rtt() {
-            Ok((conn, zero_rtt_accepted)) => {
-                info!("0-RTT connection attempt to {}", server_hostname);
-                tokio::spawn(async move {
-                    if zero_rtt_accepted.await {
-                        info!("Server accepted 0-RTT data");
-                    } else {
-                        info!("Server rejected 0-RTT (fell back to 1-RTT)");
-                    }
-                });
-                conn
-            }
-            Err(connecting) => {
-                info!("Full QUIC handshake to {}", server_hostname);
-                connecting.await?
-            }
-        };
+        let quic = connecting.await?;
         info!("QUIC connection established to {}", server_hostname);
 
         let (mut ctrl_send, mut ctrl_recv) = quic.open_bi().await?;
@@ -87,7 +79,7 @@ impl AgentTunnel {
                 info!("  TUNNEL IS LIVE!");
                 info!("  Tell players to connect to:");
                 info!("    {}:{}", server_hostname, public_port);
-                info!("  (This port is permanently yours — share it once)");
+                info!("  (Reconnections keep this port for up to five minutes)");
                 info!("===========================================");
             }
             ControlMessage::Error { message } => {
@@ -98,13 +90,18 @@ impl AgentTunnel {
             }
         }
 
-        tokio::spawn(async move {
+        let control_task = tokio::spawn(async move {
             if let Err(e) = Self::handle_control_messages(ctrl_recv).await {
                 error!("Control channel error: {}", e);
             }
         });
 
-        Ok(Self { quic, local_port })
+        Ok(Self {
+            quic,
+            local_port,
+            control_task,
+            players: JoinSet::new(),
+        })
     }
 
     async fn handle_control_messages(mut ctrl_recv: quinn::RecvStream) -> anyhow::Result<()> {
@@ -125,31 +122,45 @@ impl AgentTunnel {
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            let (quic_send, quic_recv) = match self.quic.accept_bi().await {
-                Ok(streams) => streams,
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("Server closed the connection. Shutting down.");
+            tokio::select! {
+                streams = self.quic.accept_bi() => {
+                    match streams {
+                        Ok((quic_send, quic_recv)) => {
+                            let local_port = self.local_port;
+                            self.players.spawn(async move {
+                                if let Err(e) = bridge::bridge_to_local(quic_send, quic_recv, local_port).await {
+                                    error!("Bridge error: {}", e);
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            info!("Relay connection closed: {error}");
+                            break;
+                        }
+                    }
+                }
+                _ = &mut self.control_task => {
+                    info!("Relay control channel closed");
                     break;
                 }
-                Err(e) => {
-                    error!("QUIC stream accept error: {}", e);
-                    break;
+                completed = self.players.join_next(), if !self.players.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        error!("Player task failed: {error}");
+                    }
                 }
-            };
-
-            let local_port = self.local_port;
-            tokio::spawn(async move {
-                if let Err(e) = bridge::bridge_to_local(quic_send, quic_recv, local_port).await {
-                    error!("Bridge error: {}", e);
-                }
-            });
+            }
         }
+        self.quic.close(0u8.into(), b"reconnecting");
+        self.control_task.abort();
+        self.players.abort_all();
+        while self.players.join_next().await.is_some() {}
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::next_retry_delay;
     use gamenet_core::identity;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,5 +180,16 @@ mod tests {
     #[test]
     fn verified_client_config_builds() {
         assert!(gamenet_core::crypto::client_config().is_ok());
+    }
+
+    #[test]
+    fn reconnect_delay_caps_at_fifteen_seconds() {
+        let mut delay = std::time::Duration::from_secs(1);
+        let mut seconds = Vec::new();
+        for _ in 0..6 {
+            seconds.push(delay.as_secs());
+            delay = next_retry_delay(delay);
+        }
+        assert_eq!(seconds, vec![1, 2, 4, 8, 15, 15]);
     }
 }
