@@ -82,18 +82,67 @@ impl Tunnel {
         state: Arc<Mutex<ServerState>>,
         peer_ip: IpAddr,
         global_players: Arc<Semaphore>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Option<Self>> {
         let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
         let msg = recv_msg(&mut ctrl_recv)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent disconnected before registering"))?;
-        let ControlMessage::Register {
-            protocol,
-            local_port,
-            token,
-        } = msg
-        else {
-            anyhow::bail!("Expected Register as first control message");
+        let (protocol, local_port, token, recovery_id) = match msg {
+            ControlMessage::Register {
+                protocol,
+                local_port,
+                token,
+                recovery_id,
+            } => (protocol, local_port, token, recovery_id),
+            ControlMessage::RotateIdentity {
+                old_token,
+                new_token,
+            } => {
+                let rotation = { state.lock().await.rotate(old_token, new_token, now_ms()) };
+                match rotation {
+                    Ok(public_port) => {
+                        send_msg(
+                            &mut ctrl_send,
+                            &ControlMessage::IdentityRotated { public_port },
+                        )
+                        .await?;
+                    }
+                    Err(error) => send_registration_error(&mut ctrl_send, &error.to_string()).await,
+                }
+                ctrl_send.finish()?;
+                tokio::time::timeout(Duration::from_secs(8), ctrl_send.stopped()).await??;
+                return Ok(None);
+            }
+            ControlMessage::RecoverIdentity {
+                recovery_secret,
+                new_token,
+            } => {
+                let recovery = {
+                    state
+                        .lock()
+                        .await
+                        .recover(recovery_secret, new_token, peer_ip, now_ms())
+                };
+                match recovery {
+                    Ok((public_port, old_connection)) => {
+                        if let Some(old_connection) = old_connection {
+                            old_connection.close(0u8.into(), b"identity recovered");
+                        }
+                        send_msg(
+                            &mut ctrl_send,
+                            &ControlMessage::IdentityRecovered { public_port },
+                        )
+                        .await?;
+                    }
+                    Err(error) => send_registration_error(&mut ctrl_send, &error.to_string()).await,
+                }
+                ctrl_send.finish()?;
+                tokio::time::timeout(Duration::from_secs(8), ctrl_send.stopped()).await??;
+                return Ok(None);
+            }
+            _ => anyhow::bail!(
+                "Expected Register, RotateIdentity, or RecoverIdentity as first control message"
+            ),
         };
         if protocol != Protocol::Tcp || local_port == 0 {
             let reason = "Only TCP tunnels with a nonzero local port are supported";
@@ -101,7 +150,20 @@ impl Tunnel {
             anyhow::bail!("{reason}");
         }
 
-        let registration = match state.lock().await.register(token, peer_ip, now_ms()).await {
+        let registration_result = {
+            state
+                .lock()
+                .await
+                .register_with_recovery(
+                    token,
+                    Some(recovery_id),
+                    peer_ip,
+                    now_ms(),
+                    Some(conn.clone()),
+                )
+                .await
+        };
+        let registration = match registration_result {
             Ok(registration) => registration,
             Err(error) => {
                 send_registration_error(&mut ctrl_send, &error.to_string()).await;
@@ -129,7 +191,7 @@ impl Tunnel {
             "Tunnel registered: public :{} -> agent :{} (peer {})",
             registration.public_port, local_port, peer_ip
         );
-        Ok(Self {
+        Ok(Some(Self {
             quic: conn,
             ctrl_send,
             state,
@@ -143,7 +205,7 @@ impl Tunnel {
             player_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PLAYERS)),
             global_players,
             players: JoinSet::new(),
-        })
+        }))
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {

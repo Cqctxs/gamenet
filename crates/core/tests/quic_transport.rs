@@ -65,6 +65,7 @@ async fn control_messages_round_trip_over_verified_quic() {
                 protocol: Protocol::Tcp,
                 local_port: 25565,
                 token: [42; 32],
+                recovery_id: [7; 32],
             },
         )
         .await
@@ -83,10 +84,12 @@ async fn control_messages_round_trip_over_verified_quic() {
                 protocol,
                 local_port,
                 token,
+                recovery_id,
             }) => {
                 assert_eq!(protocol, Protocol::Tcp);
                 assert_eq!(local_port, 25565);
                 assert_eq!(token, [42; 32]);
+                assert_eq!(recovery_id, [7; 32]);
             }
             other => panic!("expected registration, got {other:?}"),
         }

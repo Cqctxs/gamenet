@@ -19,6 +19,122 @@ pub fn next_retry_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(Duration::from_secs(15))
 }
 
+pub async fn rotate_identity(server_hostname: &str, insecure: bool) -> anyhow::Result<Option<u16>> {
+    let pending = identity::prepare_rotation()?;
+    let quic = connect_quic(server_hostname, insecure).await?;
+    rotate_on_connection(&quic, pending).await
+}
+
+pub async fn recover_identity(
+    server_hostname: &str,
+    insecure: bool,
+    use_backup_code: bool,
+) -> anyhow::Result<u16> {
+    let (secret, from_backup) = if use_backup_code {
+        (
+            identity::parse_recovery_code(&rpassword::prompt_password("Recovery code: ")?)?,
+            true,
+        )
+    } else {
+        match identity::read_recovery() {
+            Ok(secret) => (secret, false),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                (
+                    identity::parse_recovery_code(&rpassword::prompt_password("Recovery code: ")?)?,
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let pending = identity::prepare_recovery()?;
+    let quic = connect_quic(server_hostname, insecure).await?;
+    recover_on_connection(&quic, pending, secret, from_backup).await
+}
+
+async fn recover_on_connection(
+    quic: &Connection,
+    pending: identity::PendingRecovery,
+    secret: identity::TunnelToken,
+    from_backup: bool,
+) -> anyhow::Result<u16> {
+    let (mut send, mut receive) = quic.open_bi().await?;
+    send_msg(
+        &mut send,
+        &ControlMessage::RecoverIdentity {
+            recovery_secret: secret,
+            new_token: pending.new_token(),
+        },
+    )
+    .await?;
+    let response = recv_msg(&mut receive)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Relay closed before confirming recovery"))?;
+    match response {
+        ControlMessage::IdentityRecovered { public_port } => {
+            if from_backup {
+                identity::store_recovery(&secret)?;
+            }
+            pending.finish()?;
+            Ok(public_port)
+        }
+        ControlMessage::Error { message } => anyhow::bail!("Relay rejected recovery: {message}"),
+        other => anyhow::bail!("Unexpected recovery response: {other:?}"),
+    }
+}
+
+async fn rotate_on_connection(
+    quic: &Connection,
+    pending: identity::PendingRotation,
+) -> anyhow::Result<Option<u16>> {
+    let (mut send, mut receive) = quic.open_bi().await?;
+    send_msg(
+        &mut send,
+        &ControlMessage::RotateIdentity {
+            old_token: pending.old_token(),
+            new_token: pending.new_token(),
+        },
+    )
+    .await?;
+    let response = recv_msg(&mut receive)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Relay closed before confirming identity rotation"))?;
+    match response {
+        ControlMessage::IdentityRotated { public_port } => {
+            pending.finish()?;
+            Ok(public_port)
+        }
+        ControlMessage::Error { message } => anyhow::bail!("Relay rejected rotation: {message}"),
+        other => anyhow::bail!("Unexpected rotation response: {other:?}"),
+    }
+}
+
+async fn connect_quic(server_hostname: &str, insecure: bool) -> anyhow::Result<Connection> {
+    let client_config = if insecure {
+        crypto::insecure_client_config()?
+    } else {
+        crypto::client_config()?
+    };
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config);
+    let server_addr = format!("{}:5000", server_hostname);
+    let resolved: std::net::SocketAddr = match server_addr.parse() {
+        Ok(addr) => addr,
+        Err(_) => tokio::net::lookup_host(&server_addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve {}", server_addr))?,
+    };
+    info!("Connecting to {} ({})", server_hostname, resolved);
+    let quic = endpoint.connect(resolved, server_hostname)?.await?;
+    info!("QUIC connection established to {}", server_hostname);
+    Ok(quic)
+}
+
 impl AgentTunnel {
     /// Connect to the relay server.
     ///
@@ -31,31 +147,9 @@ impl AgentTunnel {
         insecure: bool,
     ) -> anyhow::Result<Self> {
         let token = identity::load_or_create()?;
+        let recovery_secret = identity::load_or_create_recovery()?;
 
-        let client_config = if insecure {
-            crypto::insecure_client_config()?
-        } else {
-            crypto::client_config()?
-        };
-
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-        endpoint.set_default_client_config(client_config);
-
-        let server_addr = format!("{}:5000", server_hostname);
-        let resolved: std::net::SocketAddr = match server_addr.parse() {
-            Ok(addr) => addr,
-            Err(_) => tokio::net::lookup_host(&server_addr)
-                .await?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Could not resolve {}", server_addr))?,
-        };
-        info!("Connecting to {} ({})", server_hostname, resolved);
-
-        // SNI must be the hostname, not the IP, for cert validation to work
-        let connecting = endpoint.connect(resolved, server_hostname)?;
-
-        let quic = connecting.await?;
-        info!("QUIC connection established to {}", server_hostname);
+        let quic = connect_quic(server_hostname, insecure).await?;
 
         let (mut ctrl_send, mut ctrl_recv) = quic.open_bi().await?;
 
@@ -65,6 +159,7 @@ impl AgentTunnel {
                 protocol: Protocol::Tcp,
                 local_port,
                 token,
+                recovery_id: identity::recovery_fingerprint(&recovery_secret),
             },
         )
         .await?;
@@ -160,8 +255,10 @@ impl AgentTunnel {
 
 #[cfg(test)]
 mod tests {
-    use super::next_retry_delay;
+    use super::{next_retry_delay, recover_on_connection, rotate_on_connection};
     use gamenet_core::identity;
+    use gamenet_core::protocol::ControlMessage;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -191,5 +288,152 @@ mod tests {
             delay = next_retry_delay(delay);
         }
         assert_eq!(seconds, vec![1, 2, 4, 8, 15, 15]);
+    }
+
+    #[tokio::test]
+    async fn recovery_installs_replacement_only_after_relay_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.bin");
+        let old = identity::load_or_create_at(&path).unwrap();
+        let pending = identity::prepare_recovery_at(&path).unwrap();
+        let new = pending.new_token();
+        let secret = [99; 32];
+        let (config, _) = gamenet_core::crypto::server_config().unwrap();
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_identity_path = path.clone();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let request = gamenet_core::message::recv_msg(&mut receive)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(request, ControlMessage::RecoverIdentity { recovery_secret, new_token } if recovery_secret == secret && new_token == new)
+            );
+            assert_eq!(
+                identity::load_or_create_at(&server_identity_path).unwrap(),
+                old
+            );
+            gamenet_core::message::send_msg(
+                &mut send,
+                &ControlMessage::IdentityRecovered { public_port: 10042 },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        });
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+        let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+        let port = tokio::time::timeout(
+            Duration::from_secs(3),
+            recover_on_connection(&connection, pending, secret, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(port, 10042);
+        server_task.await.unwrap();
+        assert_eq!(identity::load_or_create_at(&path).unwrap(), new);
+    }
+
+    #[tokio::test]
+    async fn rotation_installs_new_identity_only_after_relay_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.bin");
+        let old = identity::load_or_create_at(&path).unwrap();
+        let pending = identity::prepare_rotation_at(&path).unwrap();
+        let new = pending.new_token();
+
+        let (config, _) = gamenet_core::crypto::server_config().unwrap();
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let request = gamenet_core::message::recv_msg(&mut receive)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(request, ControlMessage::RotateIdentity { old_token, new_token } if old_token == old && new_token == new)
+            );
+            gamenet_core::message::send_msg(
+                &mut send,
+                &ControlMessage::IdentityRotated {
+                    public_port: Some(10042),
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        });
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+        let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            rotate_on_connection(&connection, pending),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Some(10042));
+        assert_eq!(identity::load_or_create_at(&path).unwrap(), new);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_rotation_keeps_old_identity_and_pending_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.bin");
+        let old = identity::load_or_create_at(&path).unwrap();
+        let pending = identity::prepare_rotation_at(&path).unwrap();
+        let new = pending.new_token();
+
+        let (config, _) = gamenet_core::crypto::server_config().unwrap();
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let request = gamenet_core::message::recv_msg(&mut receive)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request, ControlMessage::RotateIdentity { .. }));
+            gamenet_core::message::send_msg(
+                &mut send,
+                &ControlMessage::Error {
+                    message: "Host is still active".into(),
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        });
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+        let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                rotate_on_connection(&connection, pending),
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(identity::load_or_create_at(&path).unwrap(), old);
+        assert_eq!(
+            identity::prepare_rotation_at(&path).unwrap().new_token(),
+            new
+        );
+        server_task.await.unwrap();
     }
 }

@@ -38,6 +38,30 @@ enum Commands {
         #[arg(long, default_value_t = false, hide = true)]
         insecure: bool,
     },
+    /// Replace this host's identity after stopping its tunnel
+    RotateIdentity {
+        /// Relay server hostname
+        #[arg(long, default_value = "relay.0verclock.tech", hide = true)]
+        server: String,
+
+        /// Skip TLS certificate verification (development only)
+        #[arg(long, default_value_t = false, hide = true)]
+        insecure: bool,
+    },
+    /// Print the private recovery code to save in a password manager
+    ShowRecoveryCode,
+    /// Revoke a stolen identity and transfer its port claim
+    RecoverIdentity {
+        /// Prompt for the saved backup code even if recovery.bin exists
+        #[arg(long)]
+        use_backup_code: bool,
+        /// Relay server hostname
+        #[arg(long, default_value = "relay.0verclock.tech", hide = true)]
+        server: String,
+        /// Skip TLS certificate verification (development only)
+        #[arg(long, default_value_t = false, hide = true)]
+        insecure: bool,
+    },
 }
 
 #[tokio::main]
@@ -46,6 +70,32 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::ShowRecoveryCode => {
+            let secret = gamenet_core::identity::read_recovery()?;
+            println!("{}", gamenet_core::identity::format_recovery_code(&secret));
+            Ok(())
+        }
+        Commands::RecoverIdentity {
+            use_backup_code,
+            server,
+            insecure,
+        } => {
+            let port = tunnel::recover_identity(&server, insecure, use_backup_code).await?;
+            println!(
+                "Identity recovered. The old tunnel was revoked. Host again to reclaim {server}:{port}."
+            );
+            Ok(())
+        }
+        Commands::RotateIdentity { server, insecure } => {
+            let port = tunnel::rotate_identity(&server, insecure).await?;
+            match port {
+                Some(port) => {
+                    println!("Identity rotated. Your next tunnel can reclaim {server}:{port}.")
+                }
+                None => println!("Identity rotated. The old port claim had already expired."),
+            }
+            Ok(())
+        }
         Commands::Host {
             game,
             port,
@@ -54,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let local_port = local_port_for(game.as_deref(), port)?;
             let mut tunnel = AgentTunnel::connect(&server, local_port, insecure).await?;
+            println!("Save your recovery code in a password manager: gamenet show-recovery-code");
             let mut delay = std::time::Duration::from_secs(1);
             loop {
                 if let Err(error) = tunnel.run().await {

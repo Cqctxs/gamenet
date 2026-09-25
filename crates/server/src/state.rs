@@ -1,17 +1,20 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gamenet_core::identity::TunnelToken;
+use quinn::Connection;
 use tokio::net::TcpListener;
 
-use crate::lease::{LeaseTable, SessionId, TokenId};
+use crate::lease::{LeaseTable, RotationResult, SessionId, TokenId};
 use crate::lease_store::LeaseStore;
 
 pub struct ServerState {
     pub(crate) leases: LeaseTable,
     store: LeaseStore,
     persistence_healthy: bool,
+    active_connections: HashMap<TokenId, (SessionId, Connection)>,
 }
 
 pub struct Registration {
@@ -40,14 +43,28 @@ impl ServerState {
             leases,
             store,
             persistence_healthy: true,
+            active_connections: HashMap::new(),
         })
     }
 
+    #[cfg(test)]
     pub async fn register(
         &mut self,
         token: TunnelToken,
         peer_ip: IpAddr,
         now_ms: u64,
+    ) -> anyhow::Result<Registration> {
+        self.register_with_recovery(token, None, peer_ip, now_ms, None)
+            .await
+    }
+
+    pub async fn register_with_recovery(
+        &mut self,
+        token: TunnelToken,
+        recovery_id: Option<[u8; 32]>,
+        peer_ip: IpAddr,
+        now_ms: u64,
+        connection: Option<Connection>,
     ) -> anyhow::Result<Registration> {
         anyhow::ensure!(self.persistence_healthy, "Lease storage is unavailable");
         let token_id = TokenId::from_token(&token);
@@ -59,12 +76,22 @@ impl ServerState {
                 Err(error) => return Err(error.into()),
             };
             let mut staged = self.leases.clone();
-            let session_id = staged.activate(token_id, peer_ip, port, now_ms)?;
+            let session_id = staged.activate_with_recovery(
+                token_id,
+                recovery_id.map(TokenId),
+                peer_ip,
+                port,
+                now_ms,
+            )?;
             if let Err(error) = self.store.save(&staged.snapshot(now_ms)) {
                 self.persistence_healthy = false;
                 return Err(error);
             }
             self.leases = staged;
+            if let Some(connection) = connection {
+                self.active_connections
+                    .insert(token_id, (session_id, connection));
+            }
             return Ok(Registration {
                 listener,
                 public_port: port,
@@ -84,11 +111,72 @@ impl ServerState {
         if !self.leases.end(token_id, session_id, now_ms) {
             return Ok(false);
         }
+        if self
+            .active_connections
+            .get(&token_id)
+            .is_some_and(|(active, _)| *active == session_id)
+        {
+            self.active_connections.remove(&token_id);
+        }
         if let Err(error) = self.store.save(&self.leases.snapshot(now_ms)) {
             self.persistence_healthy = false;
             return Err(error);
         }
         Ok(true)
+    }
+
+    pub fn rotate(
+        &mut self,
+        old: TunnelToken,
+        new: TunnelToken,
+        now_ms: u64,
+    ) -> anyhow::Result<Option<u16>> {
+        anyhow::ensure!(self.persistence_healthy, "Lease storage is unavailable");
+        let mut staged = self.leases.clone();
+        let result =
+            staged.rotate_claim(TokenId::from_token(&old), TokenId::from_token(&new), now_ms)?;
+        let RotationResult::Transferred(port) = result else {
+            return Ok(result.port());
+        };
+        if let Err(error) = self.store.save(&staged.snapshot(now_ms)) {
+            self.persistence_healthy = false;
+            return Err(error);
+        }
+        self.leases = staged;
+        Ok(Some(port))
+    }
+
+    pub fn recover(
+        &mut self,
+        secret: TunnelToken,
+        new: TunnelToken,
+        peer_ip: IpAddr,
+        now_ms: u64,
+    ) -> anyhow::Result<(u16, Option<Connection>)> {
+        anyhow::ensure!(self.persistence_healthy, "Lease storage is unavailable");
+        let recovery_id = TokenId::from_token(&secret);
+        let mut staged = self.leases.clone();
+        let result =
+            staged.recover_claim(recovery_id, TokenId::from_token(&new), peer_ip, now_ms)?;
+        if !result.changed {
+            return Ok((result.port, None));
+        }
+        if let Err(error) = self.store.save(&staged.snapshot(now_ms)) {
+            self.persistence_healthy = false;
+            return Err(error);
+        }
+        self.leases = staged;
+        let connection = result.displaced.and_then(|(old, session)| {
+            match self.active_connections.remove(&old) {
+                Some((active, connection)) if active == session => Some(connection),
+                Some((active, connection)) => {
+                    self.active_connections.insert(old, (active, connection));
+                    None
+                }
+                None => None,
+            }
+        });
+        Ok((result.port, connection))
     }
 
     pub fn refresh_and_save(&mut self, now_ms: u64) -> anyhow::Result<()> {
@@ -108,6 +196,19 @@ mod tests {
 
     fn ip(address: &str) -> IpAddr {
         address.parse().unwrap()
+    }
+
+    #[test]
+    fn unknown_recovery_key_does_not_write_relay_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = ServerState::load_or_new(&path, 1_000).unwrap();
+        assert!(
+            state
+                .recover([71; 32], [72; 32], ip("192.0.2.1"), 1_000)
+                .is_err()
+        );
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -256,5 +357,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.public_port, port);
+    }
+
+    #[tokio::test]
+    async fn rotation_persists_old_token_block_and_new_port_claim() {
+        let _port_guard = PORT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = ServerState::load_or_new(&path, 1_000).unwrap();
+        let old = [41; 32];
+        let new = [42; 32];
+        let host = ip("192.0.2.41");
+        let first = state.register(old, host, 1_000).await.unwrap();
+        let port = first.public_port;
+        drop(first.listener);
+        state.end(first.token_id, first.session_id, 1_001).unwrap();
+
+        assert_eq!(state.rotate(old, new, 1_002).unwrap(), Some(port));
+        drop(state);
+
+        let mut restored = ServerState::load_or_new(&path, 1_003).unwrap();
+        assert_eq!(restored.rotate(old, new, 1_003).unwrap(), Some(port));
+        assert!(restored.register(old, host, 1_003).await.is_err());
+        assert_eq!(
+            restored
+                .register(new, host, 1_003)
+                .await
+                .unwrap()
+                .public_port,
+            port
+        );
+    }
+
+    #[test]
+    fn rotating_unknown_identity_does_not_write_relay_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("state.json");
+        let mut state = ServerState::load_or_new(&path, 1_000).unwrap();
+        assert_eq!(state.rotate([71; 32], [72; 32], 1_000).unwrap(), None);
+        assert!(!path.exists());
     }
 }

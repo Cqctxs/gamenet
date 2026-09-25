@@ -115,7 +115,7 @@ impl RelayServer {
                         }).await;
                         drop((permit, ip_permit));
                         match registration {
-                            Ok(Ok(mut tunnel)) => {
+                            Ok(Ok(Some(mut tunnel))) => {
                                 if let Err(error) = tunnel.run().await {
                                     error!("Agent {address} tunnel error: {error}");
                                 }
@@ -123,6 +123,7 @@ impl RelayServer {
                                     error!("Agent {address} cleanup error: {error}");
                                 }
                             }
+                            Ok(Ok(None)) => {}
                             Ok(Err(error)) => warn!("Agent {address} failed to register: {error}"),
                             Err(_) => warn!("Agent {address} registration timed out"),
                         }
@@ -167,6 +168,23 @@ mod tests {
         token: [u8; 32],
         protocol: Protocol,
     ) -> anyhow::Result<(Connection, quinn::RecvStream, ControlMessage)> {
+        register_with_recovery(
+            endpoint,
+            address,
+            token,
+            protocol,
+            gamenet_core::identity::recovery_fingerprint(&token),
+        )
+        .await
+    }
+
+    async fn register_with_recovery(
+        endpoint: &Endpoint,
+        address: std::net::SocketAddr,
+        token: [u8; 32],
+        protocol: Protocol,
+        recovery_id: [u8; 32],
+    ) -> anyhow::Result<(Connection, quinn::RecvStream, ControlMessage)> {
         let connection = endpoint.connect(address, "localhost")?.await?;
         let (mut send, mut receive) = connection.open_bi().await?;
         send_msg(
@@ -175,6 +193,7 @@ mod tests {
                 protocol,
                 local_port: 25565,
                 token,
+                recovery_id,
             },
         )
         .await?;
@@ -182,6 +201,112 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Missing response"))?;
         Ok((connection, receive, response))
+    }
+
+    #[tokio::test]
+    async fn recovery_revokes_active_host_and_rejects_old_token() {
+        let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(
+            RelayServer::bind_with_state_path("127.0.0.1:0", &dir.path().join("state.json"))
+                .await
+                .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+        let old = [31; 32];
+        let new = [32; 32];
+        let secret = [33; 32];
+        let recovery_id = gamenet_core::identity::recovery_fingerprint(&secret);
+        let (host, _host_control, response) =
+            register_with_recovery(&endpoint, address, old, Protocol::Tcp, recovery_id)
+                .await
+                .unwrap();
+        let ControlMessage::TunnelReady { public_port } = response else {
+            panic!("Expected port");
+        };
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", public_port))
+                .await
+                .is_ok()
+        );
+
+        let wrong = endpoint
+            .connect(address, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = wrong.open_bi().await.unwrap();
+        send_msg(
+            &mut send,
+            &ControlMessage::RecoverIdentity {
+                recovery_secret: [34; 32],
+                new_token: new,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_msg(&mut recv).await.unwrap(),
+            Some(ControlMessage::Error { .. })
+        ));
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", public_port))
+                .await
+                .is_ok()
+        );
+
+        let recovery = endpoint
+            .connect(address, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = recovery.open_bi().await.unwrap();
+        send_msg(
+            &mut send,
+            &ControlMessage::RecoverIdentity {
+                recovery_secret: secret,
+                new_token: new,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(recv_msg(&mut recv).await.unwrap(), Some(ControlMessage::IdentityRecovered { public_port: port }) if port == public_port)
+        );
+        tokio::time::timeout(Duration::from_secs(3), host.closed())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpListener::bind(("0.0.0.0", public_port))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, _, old_response) = register(&endpoint, address, old, Protocol::Tcp)
+            .await
+            .unwrap();
+        assert!(matches!(old_response, ControlMessage::Error { .. }));
+        let (replacement, _, new_response) =
+            register_with_recovery(&endpoint, address, new, Protocol::Tcp, recovery_id)
+                .await
+                .unwrap();
+        assert!(
+            matches!(new_response, ControlMessage::TunnelReady { public_port: port } if port == public_port)
+        );
+        replacement.close(0u8.into(), b"done");
+        server.close();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -212,6 +337,98 @@ mod tests {
             .unwrap();
         assert!(matches!(response, ControlMessage::Error { .. }));
         first.close(0u8.into(), b"test disconnect");
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_requires_idle_tunnel_and_rejects_old_reconnect() {
+        let _port_guard = crate::state::PORT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(
+            RelayServer::bind_with_state_path("127.0.0.1:0", &dir.path().join("state.json"))
+                .await
+                .unwrap(),
+        );
+        let address = server.local_addr().unwrap();
+        let running = Arc::clone(&server);
+        let task = tokio::spawn(async move { running.run().await });
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(gamenet_core::crypto::insecure_client_config().unwrap());
+        let old = [51; 32];
+        let new = [52; 32];
+        let (host, _, response) = register(&endpoint, address, old, Protocol::Tcp)
+            .await
+            .unwrap();
+        let ControlMessage::TunnelReady { public_port } = response else {
+            panic!("Expected port")
+        };
+
+        async fn rotate(
+            endpoint: &Endpoint,
+            address: std::net::SocketAddr,
+            old: [u8; 32],
+            new: [u8; 32],
+        ) -> ControlMessage {
+            let connection = endpoint
+                .connect(address, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut send, mut receive) = connection.open_bi().await.unwrap();
+            send_msg(
+                &mut send,
+                &ControlMessage::RotateIdentity {
+                    old_token: old,
+                    new_token: new,
+                },
+            )
+            .await
+            .unwrap();
+            recv_msg(&mut receive).await.unwrap().unwrap()
+        }
+        assert!(matches!(
+            rotate(&endpoint, address, old, new).await,
+            ControlMessage::Error { .. }
+        ));
+        host.close(0u8.into(), b"stop hosting");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server
+                .state
+                .lock()
+                .await
+                .leases
+                .active_session(crate::lease::TokenId::from_token(&old))
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(rotate(&endpoint, address, old, new).await, ControlMessage::IdentityRotated { public_port: Some(port) } if port == public_port)
+        );
+        assert!(
+            matches!(rotate(&endpoint, address, old, new).await, ControlMessage::IdentityRotated { public_port: Some(port) } if port == public_port)
+        );
+        let (_, _, old_response) = register(&endpoint, address, old, Protocol::Tcp)
+            .await
+            .unwrap();
+        assert!(matches!(old_response, ControlMessage::Error { .. }));
+        let (_, _, new_response) = register_with_recovery(
+            &endpoint,
+            address,
+            new,
+            Protocol::Tcp,
+            gamenet_core::identity::recovery_fingerprint(&old),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(new_response, ControlMessage::TunnelReady { public_port: port } if port == public_port)
+        );
         server.close();
         task.await.unwrap().unwrap();
     }

@@ -25,6 +25,12 @@ struct PersistedV2 {
 #[serde(deny_unknown_fields)]
 struct PersistedLease {
     token_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_token_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_id: Option<String>,
     port: u16,
     last_ip: Option<std::net::IpAddr>,
     expires_at_ms: u64,
@@ -116,6 +122,8 @@ impl LeaseStore {
             anyhow::ensure!(tokens.insert(token), "Duplicate legacy token");
             records.push(LeaseRecord {
                 token_id: TokenId::from_token(&token),
+                retired_token_ids: Vec::new(),
+                recovery_id: None,
                 port: *port,
                 last_ip: None,
                 expires_at_ms: now_ms.saturating_add(GRACE_MS),
@@ -182,6 +190,13 @@ impl PersistedLease {
     fn from_record(record: &LeaseRecord) -> Self {
         Self {
             token_id: hex_32(&record.token_id.0),
+            retired_token_id: None,
+            retired_token_ids: record
+                .retired_token_ids
+                .iter()
+                .map(|id| hex_32(&id.0))
+                .collect(),
+            recovery_id: record.recovery_id.map(|id| hex_32(&id.0)),
             port: record.port,
             last_ip: record.last_ip,
             expires_at_ms: record.expires_at_ms,
@@ -197,6 +212,16 @@ impl PersistedLease {
         );
         Ok(LeaseRecord {
             token_id: TokenId(parse_hex_32(&self.token_id)?),
+            retired_token_ids: self
+                .retired_token_ids
+                .into_iter()
+                .chain(self.retired_token_id)
+                .map(|id| parse_hex_32(&id).map(TokenId))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            recovery_id: self
+                .recovery_id
+                .map(|id| parse_hex_32(&id).map(TokenId))
+                .transpose()?,
             port: self.port,
             last_ip: self.last_ip,
             expires_at_ms: self.expires_at_ms,
